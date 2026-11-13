@@ -38,7 +38,7 @@ button:disabled{opacity:.5;cursor:default}
 <body>
 <main>
 <h1>📚 Склейка FB2</h1>
-<p class="sub">Выберите скачанные zip и fb2 — получите одну книгу. Всё работает в браузере, файлы никуда не отправляются.</p>
+<p class="sub">Выберите скачанные zip и fb2 — получите одну книгу. Можно добавить уже склеенный файл и новый том: всё встанет по порядку. Всё работает в браузере, файлы никуда не отправляются.</p>
 
 <label class="drop" id="drop"><b>Выбрать файлы</b><span>.zip и .fb2, можно сразу несколько</span>
 <input id="inp" type="file" multiple accept=".zip,.fb2,application/zip,application/x-fictionbook+xml,text/xml"></label>
@@ -117,52 +117,93 @@ function prefixIds(doc,pre){
   }
 }
 
+const MARK="fb2merge";
+function readMarker(root){
+  const desc=kid(root,"description");let parts=null;
+  for(const ci of kids(desc,"custom-info"))if(ci.getAttribute("info-type")===MARK){
+    try{parts=JSON.parse(ci.textContent).map(d=>({t:d.t,n:d.n}))}catch{parts=null}}
+  if(!parts){ // склейки старого формата: список томов в аннотации
+    const ann=kid(kid(desc,"title-info"),"annotation");
+    if(ann){const ps=kids(ann,"p").map(p=>p.textContent.trim());
+      const m=/^Сборник из (\d+) книг/.exec(ps[0]||"");
+      if(m){const ts=ps.slice(1).map(x=>x.replace(/^\d+\.\s*/,""));
+        if(ts.length===+m[1])parts=ts.map((t,i)=>({t,n:i+1}))}}}
+  const main=kids(root,"body").find(b=>b.getAttribute("name")!=="notes");
+  return parts&&main&&kids(main,"section").length===parts.length?{parts,main}:null;
+}
+
 function merge(items){
-  const books=[];
+  const srcs=[];
   for(const it of items){
     const doc=new DOMParser().parseFromString(decode(it.buf),"application/xml");
     if(doc.getElementsByTagName("parsererror").length||doc.documentElement.localName!=="FictionBook"){say(`• ${it.name}: некорректный fb2, пропущен`,"err");continue}
-    const ti=kid(kid(doc.documentElement,"description"),"title-info");
-    const seq=kid(ti,"sequence");
-    const n=parseInt(seq?.getAttribute("number"));
-    books.push({doc,ti,name:it.name,num:isNaN(n)?Infinity:n,title:(kid(ti,"book-title")?.textContent||it.name).trim()});
+    srcs.push({doc,name:it.name});
   }
-  if(books.length<2)throw new Error("Нужно минимум 2 корректные книги");
-  books.sort((a,b)=>a.num-b.num||a.name.localeCompare(b.name,undefined,{numeric:true}));
-  books.forEach((b,i)=>prefixIds(b.doc,`b${i+1}_`));
+  if(srcs.length<2)throw new Error("Нужно минимум 2 корректных файла");
+  srcs.forEach((s,i)=>prefixIds(s.doc,`b${i+1}_`));
 
-  const base=books[0].doc,root=base.documentElement,ti=books[0].ti;
+  const parts=[],notesKids=[],bins=[];
+  srcs.forEach((s,si)=>{
+    const root=s.root=s.doc.documentElement;
+    s.ti=kid(kid(root,"description"),"title-info");
+    const mk=readMarker(root);
+    if(mk){
+      kids(mk.main,"section").forEach((sec,i)=>{
+        let ch=[...sec.children];if(ch[0]&&ch[0].localName==="title")ch=ch.slice(1);
+        const n=mk.parts[i].n;
+        parts.push({si,title:mk.parts[i].t,num:n==null?Infinity:+n,name:`${s.name}#${String(i).padStart(3,"0")}`,ch});
+      });
+    }else{
+      const n=parseInt(kid(s.ti,"sequence")?.getAttribute("number"));
+      const ch=[];
+      for(const b of kids(root,"body"))if(b.getAttribute("name")!=="notes")for(const c of b.children)if(c.localName!=="title")ch.push(c);
+      parts.push({si,title:(kid(s.ti,"book-title")?.textContent||s.name).trim(),num:isNaN(n)?Infinity:n,name:s.name,ch});
+    }
+    for(const b of kids(root,"body"))if(b.getAttribute("name")==="notes")notesKids.push(...b.children);
+    bins.push(...kids(root,"binary"));
+  });
+
+  // повторы (например, новая версия недописанной книги): оставляем более полную
+  const size=p=>p.ch.reduce((a,c)=>a+c.textContent.length,0);
+  const byT=new Map();
+  for(const p of parts){
+    const k=p.title.toLowerCase(),o=byT.get(k);
+    if(!o)byT.set(k,p);
+    else{byT.set(k,size(p)>size(o)?p:o);say(`• «${p.title}» встречается дважды — оставлена более полная версия`)}
+  }
+  const list=[...byT.values()].sort((a,b)=>a.num-b.num||a.name.localeCompare(b.name,undefined,{numeric:true}));
+  if(list.length<2)throw new Error("Нужно минимум 2 разные книги");
+
+  const bs=srcs[list[0].si],doc=bs.doc,root=bs.root,ti=bs.ti,desc=kid(root,"description");
   const seq0=kid(ti,"sequence"),seqName=seq0?.getAttribute("name");
-  const title=seqName||books[0].title;
+  const title=seqName||list[0].title;
   kid(ti,"book-title").textContent=title;
   seq0?.removeAttribute("number");
   kids(ti,"annotation").forEach(a=>a.remove());
-  const ann=base.createElementNS(FB,"annotation");
-  [`Сборник из ${books.length} книг:`,...books.map((b,i)=>`${i+1}. ${b.title}`)].forEach(t=>{
-    const p=base.createElementNS(FB,"p");p.textContent=t;ann.append(p)});
+  const ann=doc.createElementNS(FB,"annotation");
+  [`Сборник из ${list.length} книг:`,...list.map((b,i)=>`${i+1}. ${b.title}`)].forEach(t=>{
+    const p=doc.createElementNS(FB,"p");p.textContent=t;ann.append(p)});
   const anchors=kids(ti,"genre").concat(kids(ti,"author"),kids(ti,"book-title"));
-  const last=anchors.sort((a,b)=>a.compareDocumentPosition(b)&4?-1:1).pop();
-  last.after(ann);
+  anchors.sort((a,b)=>a.compareDocumentPosition(b)&4?-1:1).pop().after(ann);
+  kids(desc,"custom-info").filter(c=>c.getAttribute("info-type")===MARK).forEach(c=>c.remove());
+  const ci=doc.createElementNS(FB,"custom-info");ci.setAttribute("info-type",MARK);
+  ci.textContent=JSON.stringify(list.map(p=>({t:p.title,n:isFinite(p.num)?p.num:null})));
+  desc.append(ci);
 
-  const main=base.createElementNS(FB,"body"),notes=base.createElementNS(FB,"body");
+  const main=doc.createElementNS(FB,"body"),notes=doc.createElementNS(FB,"body");
   notes.setAttribute("name","notes");
-  const bins=[];
-  for(const b of books){
-    const sec=base.createElementNS(FB,"section"),t=base.createElementNS(FB,"title"),p=base.createElementNS(FB,"p");
-    p.textContent=b.title;t.append(p);sec.append(t);
-    for(const body of kids(b.doc.documentElement,"body")){
-      for(const ch of [...body.children]){
-        if(body.getAttribute("name")==="notes")notes.append(base.importNode(ch,true));
-        else if(ch.localName!=="title")sec.append(base.importNode(ch,true));
-      }
-    }
+  for(const p of list){
+    const sec=doc.createElementNS(FB,"section"),t=doc.createElementNS(FB,"title"),pp=doc.createElementNS(FB,"p");
+    pp.textContent=p.title;t.append(pp);sec.append(t);
+    p.ch.forEach(c=>sec.append(doc.importNode(c,true)));
     main.append(sec);
-    kids(b.doc.documentElement,"binary").forEach(x=>bins.push(base.importNode(x,true)));
   }
+  notesKids.forEach(c=>notes.append(doc.importNode(c,true)));
+  const binsI=bins.map(x=>doc.importNode(x,true));
   [...root.children].filter(e=>/^(body|binary)$/.test(e.localName)).forEach(e=>e.remove());
   root.append(main);if(notes.children.length)root.append(notes);
   const used=new Set([...root.getElementsByTagName("*")].map(e=>hrefAttr(e)?.value).filter(v=>v&&v[0]==="#").map(v=>v.slice(1)));
-  bins.filter(x=>used.has(x.getAttribute("id"))).forEach(x=>root.append(x));
+  binsI.filter(x=>used.has(x.getAttribute("id"))).forEach(x=>root.append(x));
 
   const au=kid(ti,"author");
   const author=au?[kid(au,"last-name")?.textContent,kid(au,"first-name")?.textContent].filter(Boolean).join(" "):"";
@@ -174,7 +215,7 @@ function merge(items){
   const ids=new Set([...chk.getElementsByTagName("*")].map(e=>e.getAttribute("id")).filter(Boolean));
   const broken=[...chk.getElementsByTagName("*")].map(e=>hrefAttr(e)?.value).filter(v=>v&&v[0]==="#"&&!ids.has(v.slice(1))).length;
   const name=(author?`${title} - ${author}`:title).replace(/[<>:"\/\\|?*]/g,"_").trim();
-  return{text,name,count:books.length,broken,titles:books.map(b=>b.title)};
+  return{text,name,count:list.length,broken,titles:list.map(b=>b.title)};
 }
 
 $("go").onclick=async()=>{
