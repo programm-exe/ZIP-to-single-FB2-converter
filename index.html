@@ -35,6 +35,7 @@ button:disabled{opacity:.5;cursor:default}
 .mini{width:auto;padding:4px 11px;font-weight:700;background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:8px;margin-left:4px}
 .chk{display:flex;gap:8px;align-items:center;margin:12px 0;font-size:.95rem}
 [hidden]{display:none!important}
+progress{display:block}
 </style>
 </head>
 <body>
@@ -48,6 +49,7 @@ button:disabled{opacity:.5;cursor:default}
 <button id="go" disabled>Показать порядок</button>
 <button id="clr" class="sec" hidden>Очистить</button>
 <div id="log"></div>
+<progress id="prog" max="1" value="0" hidden style="width:100%;height:6px;margin:10px 0;accent-color:var(--ac)"></progress>
 
 <div id="prev" class="res" hidden>
 <h2>Порядок томов</h2><div class="sub">Переставьте стрелками или уберите лишнее.</div>
@@ -58,7 +60,8 @@ button:disabled{opacity:.5;cursor:default}
 
 <div id="res" class="res" hidden>
 <h2 id="rname"></h2><div id="rinfo" class="sub"></div>
-<button id="save">Сохранить файл</button>
+<button id="save">Сохранить FB2</button>
+<button id="saveE" class="sec">Сохранить EPUB</button>
 <div id="hint" class="hint" hidden>Платформа не разрешает сохранять .fb2 напрямую, поэтому файл сохранён как <b>.fb2.txt</b>. Переименуйте его, убрав «.txt» в конце, — внутри обычный FB2.</div>
 </div>
 </main>
@@ -102,17 +105,35 @@ function decode(buf){
   return t.replace(/^\uFEFF/,"");
 }
 
+// --- прогресс ---
+function showProg(cur,total){
+  const p=$("prog");
+  if(total<=1){p.hidden=true;return}
+  p.hidden=false;p.max=total;p.value=cur;
+}
+function hideProg(){const p=$("prog");p.hidden=true;p.value=0}
+
 async function collect(){
   const out=[];
+  const total=files.length;
+  let done=0;
+  showProg(0,total);
   for(const f of files){
+    done++;
+    showProg(done-1,total);
+    // даём браузеру перерисовать прогресс
+    await new Promise(r=>setTimeout(r,0));
     if(/\.fb2$/i.test(f.name)){out.push({name:f.name,buf:await f.arrayBuffer()});continue}
     try{
       const z=await JSZip.loadAsync(f);
       const ents=Object.values(z.files).filter(e=>!e.dir&&/\.fb2$/i.test(e.name));
       if(!ents.length)say(`• ${f.name}: в архиве нет fb2`,"err");
-      for(const e of ents)out.push({name:e.name.split("/").pop(),buf:await e.async("arraybuffer")});
+      for(const e of ents){
+        out.push({name:e.name.split("/").pop(),buf:await e.async("arraybuffer")});
+      }
     }catch(err){say(`• ${f.name}: не удалось открыть архив`,"err")}
   }
+  showProg(total,total);
   return out;
 }
 
@@ -230,7 +251,7 @@ function build(srcs,list,notesKids,bins,covers,custom){
   const ids=new Set([...chk.getElementsByTagName("*")].map(e=>e.getAttribute("id")).filter(Boolean));
   const broken=[...chk.getElementsByTagName("*")].map(e=>hrefAttr(e)?.value).filter(v=>v&&v[0]==="#"&&!ids.has(v.slice(1))).length;
   const name=(author?`${title} - ${author}`:title).replace(/[<>:"\/\\|?*]/g,"_").trim();
-  return{text,name,count:list.length,broken,titles:list.map(b=>b.title)};
+  return{text,name,count:list.length,broken,titles:list.map(b=>b.title),root};
 }
 
 function renderPrev(){
@@ -267,7 +288,7 @@ $("build").onclick=()=>{
     const list=order.map(id=>an.list.find(p=>p.id===id)).filter(Boolean);
     const auto=an.list.filter(p=>order.includes(p.id));
     const r=build(an.srcs,list,an.notesKids,an.bins,$("cov").checked,list.some((p,i)=>p!==auto[i]));
-    result={name:r.name,blob:new Blob([r.text],{type:"application/octet-stream"})};
+    result={name:r.name,root:r.root,epub:null,blob:new Blob([r.text],{type:"application/octet-stream"})};
     $("rname").textContent=r.name+".fb2";
     $("rinfo").textContent=`${r.count} книг, ${kb(result.blob.size)}`+(r.broken?`, битых ссылок: ${r.broken}`:"");
     $("res").hidden=false;$("hint").hidden=true;
@@ -275,20 +296,124 @@ $("build").onclick=()=>{
   }catch(e){say(e.message||String(e),"err")}
 };
 
-$("save").onclick=async()=>{
-  if(!result)return;
-  const dl=window.claude?.use?await claude.use("downloads"):null;
-  if(!dl){ // обычный браузер: прямое скачивание
-    const a=document.createElement("a");a.href=URL.createObjectURL(result.blob);a.download=result.name+".fb2";
-    document.body.append(a);a.click();a.remove();return;
+// ---------------------------------------------------------------- FB2 -> EPUB
+async function toEpub(root){
+  const T=s=>(s||"").replace(/\s+/g," ").trim();
+  const esc=s=>String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+  const ti=kid(kid(root,"description"),"title-info");
+  const title=T(kid(ti,"book-title")?.textContent)||"Книга";
+  const authors=kids(ti,"author").map(a=>["first-name","middle-name","last-name"].map(n=>T(kid(a,n)?.textContent)).filter(Boolean).join(" ")).filter(Boolean);
+  const lang=T(kid(ti,"lang")?.textContent)||"ru";
+  const series=kid(ti,"sequence")?.getAttribute("name");
+  const zip=new JSZip();
+  zip.file("mimetype","application/epub+zip",{compression:"STORE"});
+  zip.file("META-INF/container.xml",'<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>');
+
+  const EXT={"image/jpeg":"jpg","image/jpg":"jpg","image/png":"png","image/gif":"gif","image/webp":"webp","image/svg+xml":"svg"};
+  const imgs={};
+  kids(root,"binary").forEach((b,i)=>{
+    const ty=(b.getAttribute("content-type")||"image/jpeg").toLowerCase(),ext=EXT[ty];if(!ext)return;
+    const file=`images/img${i}.${ext}`;
+    imgs[b.getAttribute("id")]={file,ty:ty==="image/jpg"?"image/jpeg":ty,mid:`im${i}`};
+    zip.file("OEBPS/"+file,b.textContent.replace(/\s+/g,""),{base64:true});
+  });
+  const cimg=kid(kid(ti,"coverpage"),"image");
+  const cv=cimg&&imgs[(hrefAttr(cimg)?.value||"").slice(1)];
+
+  const idFile={};let cur="";
+  const aid=e=>{const id=e.getAttribute("id");if(!id)return"";idFile[id]=cur;return` id="${esc(id)}"`};
+  const im=e=>{const m=imgs[(hrefAttr(e)?.value||"").slice(1)];return m?`<img src="${m.file}" alt=""/>`:""};
+  const W={strong:"strong",emphasis:"em",strikethrough:"del",sub:"sub",sup:"sup",code:"code",style:"span"};
+  function inl(n){
+    let s="";
+    for(const c of n.childNodes){
+      if(c.nodeType===3){s+=esc(c.nodeValue);continue}
+      if(c.nodeType!==1)continue;
+      const t=c.localName,a=c.getAttribute("id")?`<span${aid(c)}></span>`:"";
+      if(t==="image"){s+=a+im(c);continue}
+      const x=inl(c);
+      if(t==="a"){
+        const h=hrefAttr(c)?.value||"";
+        s+=a+(h[0]==="#"?`<a href="@@${esc(h.slice(1))}@@"${c.getAttribute("type")==="note"?' epub:type="noteref"':""}>${x}</a>`:`<a href="${esc(h)}">${x}</a>`);
+      }else if(W[t])s+=`${a}<${W[t]}>${x}</${W[t]}>`;
+      else s+=a+x;
+    }
+    return s;
   }
-  try{await dl.save({filename:result.name+".fb2",data:result.blob})}
+  const tbl=n=>[...n.children].map(r=>`<tr>${[...r.children].map(c=>`<${c.localName}>${inl(c)}</${c.localName}>`).join("")}</tr>`).join("");
+  function blk(nodes,d){
+    let s="";
+    for(const c of nodes){
+      const t=c.localName,i=aid(c);
+      if(t==="title"){const h=Math.min(d,6);s+=`<h${h}${i}>${kids(c,"p").map(inl).join("<br/>")||esc(T(c.textContent))}</h${h}>`}
+      else if(t==="section")s+=`<div class="sec"${i}>${blk([...c.children],d+1)}</div>`;
+      else if(t==="p")s+=`<p${i}>${inl(c)}</p>`;
+      else if(t==="empty-line")s+='<p class="el">&#160;</p>';
+      else if(t==="subtitle")s+=`<p class="subtitle"${i}>${inl(c)}</p>`;
+      else if(t==="image")s+=`<div class="img">${im(c)}</div>`;
+      else if(t==="text-author")s+=`<p class="ta">${inl(c)}</p>`;
+      else if(t==="v")s+=`<p class="v">${inl(c)}</p>`;
+      else if(t==="table")s+=`<table>${tbl(c)}</table>`;
+      else if(/^(epigraph|annotation|cite|poem|stanza)$/.test(t))s+=`<div class="${t}"${i}>${blk([...c.children],d)}</div>`;
+    }
+    return s;
+  }
+
+  const pages=[],toc=[];
+  if(cv){cur="cover.xhtml";pages.push({file:cur,t:"Обложка",body:`<div class="img"><img src="${cv.file}" alt=""/></div>`})}
+  const main=kids(root,"body").find(b=>b.getAttribute("name")!=="notes");
+  kids(main,"section").forEach((part,pi)=>{
+    const pt=T(kid(part,"title")?.textContent)||`Книга ${pi+1}`;
+    cur=`p${pi}.xhtml`;
+    pages.push({file:cur,t:pt,body:blk([...part.children].filter(c=>c.localName!=="section"),1)});
+    const e={file:cur,t:pt,ch:[]};toc.push(e);
+    kids(part,"section").forEach((ch,ci)=>{
+      cur=`p${pi}_${ci}.xhtml`;
+      const ct=T(kid(ch,"title")?.textContent)||`Глава ${ci+1}`;
+      pages.push({file:cur,t:ct,body:blk([ch],1)});e.ch.push({file:cur,t:ct});
+    });
+  });
+  const nb=kids(root,"body").find(b=>b.getAttribute("name")==="notes");
+  if(nb){cur="notes.xhtml";pages.push({file:cur,t:"Примечания",body:"<h1>Примечания</h1>"+blk([...nb.children],1)});toc.push({file:cur,t:"Примечания",ch:[]})}
+
+  const X=(t,b)=>`<?xml version="1.0" encoding="utf-8"?>\n<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.w3.org/2007/ops" lang="${lang}" xml:lang="${lang}"><head><meta charset="utf-8"/><title>${esc(t)}</title><link rel="stylesheet" type="text/css" href="style.css"/></head><body>${b}</body></html>`;
+  const fix=h=>h.replace(/@@([^@]*)@@/g,(m,id)=>idFile[id]?`${idFile[id]}#${id}`:`#${id}`);
+  pages.forEach(p=>zip.file("OEBPS/"+p.file,X(p.t,fix(p.body))));
+  zip.file("OEBPS/style.css","body{margin:0 .5em;line-height:1.4}p{margin:0;text-indent:1.3em;text-align:justify}h1,h2,h3,h4,h5,h6{text-align:center;text-indent:0;margin:1.2em 0 .8em;line-height:1.2}.el{height:1em}.img{text-align:center;text-indent:0;margin:1em 0}img{max-width:100%;height:auto}.subtitle,.ta{text-align:center;font-weight:bold;text-indent:0}.ta{text-align:right;font-style:italic;font-weight:normal}.epigraph{margin:1em 0 1em 25%;font-style:italic}.cite{margin:1em 2em}.poem,.stanza{margin:.6em 0 .6em 8%}.v{text-indent:0}table{border-collapse:collapse}td,th{border:1px solid #888;padding:.2em .4em}");
+
+  const a=(f,t)=>`<a href="${f}">${esc(t)}</a>`;
+  zip.file("OEBPS/nav.xhtml",X(title,`<nav epub:type="toc" id="toc"><h1>Содержание</h1><ol>${toc.map(e=>`<li>${a(e.file,e.t)}${e.ch.length?`<ol>${e.ch.map(c=>`<li>${a(c.file,c.t)}</li>`).join("")}</ol>`:""}</li>`).join("")}</ol></nav>`));
+
+  const uid="urn:uuid:"+(crypto.randomUUID?crypto.randomUUID():Date.now()+"-"+Math.random().toString(16).slice(2));
+  let po=0;
+  const nv=(n,f,t,inner)=>`<navPoint id="n${n}" playOrder="${n}"><navLabel><text>${esc(t)}</text></navLabel><content src="${f}"/>${inner||""}</navPoint>`;
+  const ncx=toc.map(e=>{const p=++po;return nv(p,e.file,e.t,e.ch.map(c=>{const q=++po;return nv(q,c.file,c.t)}).join(""))}).join("");
+  zip.file("OEBPS/toc.ncx",`<?xml version="1.0" encoding="utf-8"?><ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1"><head><meta name="dtb:uid" content="${uid}"/><meta name="dtb:depth" content="2"/><meta name="dtb:totalPageCount" content="0"/><meta name="dtb:maxPageNumber" content="0"/></head><docTitle><text>${esc(title)}</text></docTitle><navMap>${ncx}</navMap></ncx>`);
+
+  const items=pages.map((p,i)=>`<item id="x${i}" href="${p.file}" media-type="application/xhtml+xml"/>`).join("")
+    +Object.values(imgs).map(m=>`<item id="${m.mid}" href="${m.file}" media-type="${m.ty}"${m===cv?' properties="cover-image"':""}/>`).join("");
+  zip.file("OEBPS/content.opf",`<?xml version="1.0" encoding="utf-8"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid" xml:lang="${lang}"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="uid">${uid}</dc:identifier><dc:title>${esc(title)}</dc:title>${authors.map(x=>`<dc:creator>${esc(x)}</dc:creator>`).join("")}<dc:language>${lang}</dc:language><meta property="dcterms:modified">${new Date().toISOString().replace(/\.\d+Z$/,"Z")}</meta>${series?`<meta name="calibre:series" content="${esc(series)}"/>`:""}${cv?`<meta name="cover" content="${cv.mid}"/>`:""}</metadata><manifest><item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/><item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/><item id="css" href="style.css" media-type="text/css"/>${items}</manifest><spine toc="ncx">${pages.map((p,i)=>`<itemref idref="x${i}"/>`).join("")}</spine></package>`);
+  return zip.generateAsync({type:"blob",mimeType:"application/epub+zip",compression:"DEFLATE"});
+}
+
+async function offer(blob,name,ext){
+  const dl=window.claude?.use?await claude.use("downloads"):null;
+  if(!dl){const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=name+"."+ext;document.body.append(a);a.click();a.remove();return}
+  try{await dl.save({filename:name+"."+ext,data:blob})}
   catch(e){
-    if(e&&e.code==="rejected_extension"){
-      try{await dl.save({filename:result.name+".fb2.txt",data:result.blob});$("hint").hidden=false}
+    if(e&&e.code==="rejected_extension"&&ext==="fb2"){
+      try{await dl.save({filename:name+".fb2.txt",data:blob});$("hint").hidden=false}
       catch(e2){if(e2.code!=="declined")say("Не удалось сохранить: "+(e2.code||e2.message),"err")}
     }else if(e&&e.code!=="declined")say("Не удалось сохранить: "+(e.code||e.message),"err");
   }
+}
+$("save").onclick=()=>{if(result)offer(result.blob,result.name,"fb2")};
+$("saveE").onclick=async()=>{
+  if(!result)return;
+  try{
+    if(!result.epub){say("Готовлю EPUB…");result.epub=await toEpub(result.root)}
+    await offer(result.epub,result.name,"epub");
+  }catch(e){say("Ошибка EPUB: "+(e.message||e),"err")}
 };
 </script>
 </body>
