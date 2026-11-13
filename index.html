@@ -32,6 +32,8 @@ button:disabled{opacity:.5;cursor:default}
 .res{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:14px;margin-top:14px}
 .res h2{font-size:1rem;margin:0 0 4px;overflow-wrap:anywhere}
 .hint{font-size:.88rem;color:var(--mut);margin-top:10px}
+.mini{width:auto;padding:4px 11px;font-weight:700;background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:8px;margin-left:4px}
+.chk{display:flex;gap:8px;align-items:center;margin:12px 0;font-size:.95rem}
 [hidden]{display:none!important}
 </style>
 </head>
@@ -43,9 +45,16 @@ button:disabled{opacity:.5;cursor:default}
 <label class="drop" id="drop"><b>Выбрать файлы</b><span>.zip и .fb2, можно сразу несколько</span>
 <input id="inp" type="file" multiple accept=".zip,.fb2,application/zip,application/x-fictionbook+xml,text/xml"></label>
 <ul id="list"></ul>
-<button id="go" disabled>Склеить</button>
+<button id="go" disabled>Показать порядок</button>
 <button id="clr" class="sec" hidden>Очистить</button>
 <div id="log"></div>
+
+<div id="prev" class="res" hidden>
+<h2>Порядок томов</h2><div class="sub">Переставьте стрелками или уберите лишнее.</div>
+<ul id="plist"></ul>
+<label class="chk"><input type="checkbox" id="cov" checked> Обложка перед каждым томом</label>
+<button id="build">Собрать файл</button>
+</div>
 
 <div id="res" class="res" hidden>
 <h2 id="rname"></h2><div id="rinfo" class="sub"></div>
@@ -58,7 +67,7 @@ button:disabled{opacity:.5;cursor:default}
 <script>
 const FB="http://www.gribuser.ru/xml/fictionbook/2.0",XL="http://www.w3.org/1999/xlink";
 const $=id=>document.getElementById(id);
-let files=[],result=null;
+let files=[],result=null,items=[],order=[],meta={};
 
 const kids=(e,n)=>e?[...e.children].filter(c=>c.localName===n):[];
 const kid=(e,n)=>kids(e,n)[0];
@@ -79,7 +88,7 @@ function addFiles(fl){
   renderList();
 }
 $("inp").onchange=e=>{addFiles(e.target.files);e.target.value=""};
-$("clr").onclick=()=>{files=[];result=null;$("res").hidden=true;$("log").innerHTML="";renderList()};
+$("clr").onclick=()=>{files=[];result=null;$("res").hidden=true;$("prev").hidden=true;$("log").innerHTML="";renderList()};
 const dz=$("drop");
 dz.ondragover=e=>{e.preventDefault();dz.classList.add("over")};
 dz.ondragleave=()=>dz.classList.remove("over");
@@ -132,11 +141,11 @@ function readMarker(root){
   return parts&&main&&kids(main,"section").length===parts.length?{parts,main}:null;
 }
 
-function merge(items){
+function analyze(items,quiet){
   const srcs=[];
   for(const it of items){
     const doc=new DOMParser().parseFromString(decode(it.buf),"application/xml");
-    if(doc.getElementsByTagName("parsererror").length||doc.documentElement.localName!=="FictionBook"){say(`• ${it.name}: некорректный fb2, пропущен`,"err");continue}
+    if(doc.getElementsByTagName("parsererror").length||doc.documentElement.localName!=="FictionBook"){if(!quiet)say(`• ${it.name}: некорректный fb2, пропущен`,"err");continue}
     srcs.push({doc,name:it.name});
   }
   if(srcs.length<2)throw new Error("Нужно минимум 2 корректных файла");
@@ -151,13 +160,15 @@ function merge(items){
       kids(mk.main,"section").forEach((sec,i)=>{
         let ch=[...sec.children];if(ch[0]&&ch[0].localName==="title")ch=ch.slice(1);
         const n=mk.parts[i].n;
-        parts.push({si,title:mk.parts[i].t,num:n==null?Infinity:+n,name:`${s.name}#${String(i).padStart(3,"0")}`,ch});
+        const nm=`${s.name}#${String(i).padStart(3,"0")}`;
+        parts.push({id:`${si}|${nm}`,si,title:mk.parts[i].t,num:n==null?Infinity:+n,name:nm,ch,cover:null});
       });
     }else{
       const n=parseInt(kid(s.ti,"sequence")?.getAttribute("number"));
       const ch=[];
       for(const b of kids(root,"body"))if(b.getAttribute("name")!=="notes")for(const c of b.children)if(c.localName!=="title")ch.push(c);
-      parts.push({si,title:(kid(s.ti,"book-title")?.textContent||s.name).trim(),num:isNaN(n)?Infinity:n,name:s.name,ch});
+      const im=kid(kid(s.ti,"coverpage"),"image");
+      parts.push({id:`${si}|${s.name}`,si,title:(kid(s.ti,"book-title")?.textContent||s.name).trim(),num:isNaN(n)?Infinity:n,name:s.name,ch,cover:im?im.cloneNode(true):null});
     }
     for(const b of kids(root,"body"))if(b.getAttribute("name")==="notes")notesKids.push(...b.children);
     bins.push(...kids(root,"binary"));
@@ -169,11 +180,14 @@ function merge(items){
   for(const p of parts){
     const k=p.title.toLowerCase(),o=byT.get(k);
     if(!o)byT.set(k,p);
-    else{byT.set(k,size(p)>size(o)?p:o);say(`• «${p.title}» встречается дважды — оставлена более полная версия`)}
+    else{byT.set(k,size(p)>size(o)?p:o);if(!quiet)say(`• «${p.title}» встречается дважды — оставлена более полная версия`)}
   }
   const list=[...byT.values()].sort((a,b)=>a.num-b.num||a.name.localeCompare(b.name,undefined,{numeric:true}));
   if(list.length<2)throw new Error("Нужно минимум 2 разные книги");
+  return{srcs,list,notesKids,bins};
+}
 
+function build(srcs,list,notesKids,bins,covers,custom){
   const bs=srcs[list[0].si],doc=bs.doc,root=bs.root,ti=bs.ti,desc=kid(root,"description");
   const seq0=kid(ti,"sequence"),seqName=seq0?.getAttribute("name");
   const title=seqName||list[0].title;
@@ -187,7 +201,7 @@ function merge(items){
   anchors.sort((a,b)=>a.compareDocumentPosition(b)&4?-1:1).pop().after(ann);
   kids(desc,"custom-info").filter(c=>c.getAttribute("info-type")===MARK).forEach(c=>c.remove());
   const ci=doc.createElementNS(FB,"custom-info");ci.setAttribute("info-type",MARK);
-  ci.textContent=JSON.stringify(list.map(p=>({t:p.title,n:isFinite(p.num)?p.num:null})));
+  ci.textContent=JSON.stringify(list.map((p,i)=>({t:p.title,n:custom?i+1:(isFinite(p.num)?p.num:null)})));
   desc.append(ci);
 
   const main=doc.createElementNS(FB,"body"),notes=doc.createElementNS(FB,"body");
@@ -195,6 +209,7 @@ function merge(items){
   for(const p of list){
     const sec=doc.createElementNS(FB,"section"),t=doc.createElementNS(FB,"title"),pp=doc.createElementNS(FB,"p");
     pp.textContent=p.title;t.append(pp);sec.append(t);
+    if(covers&&p.cover)sec.append(doc.importNode(p.cover,true));
     p.ch.forEach(c=>sec.append(doc.importNode(c,true)));
     main.append(sec);
   }
@@ -218,20 +233,46 @@ function merge(items){
   return{text,name,count:list.length,broken,titles:list.map(b=>b.title)};
 }
 
+function renderPrev(){
+  const box=$("plist");box.innerHTML="";
+  order.forEach((id,i)=>{
+    const li=document.createElement("li"),t=document.createElement("span"),act=document.createElement("span");
+    t.textContent=`${i+1}. ${meta[id]}`;
+    const mk=(txt,fn,dis)=>{const b=document.createElement("button");b.className="mini";b.textContent=txt;b.disabled=dis;b.onclick=fn;act.append(b)};
+    mk("↑",()=>{[order[i-1],order[i]]=[order[i],order[i-1]];renderPrev()},i===0);
+    mk("↓",()=>{[order[i+1],order[i]]=[order[i],order[i+1]];renderPrev()},i===order.length-1);
+    mk("✕",()=>{order.splice(i,1);renderPrev()},false);
+    li.append(t,act);box.append(li);
+  });
+  $("build").disabled=order.length<2;
+}
+
 $("go").onclick=async()=>{
-  $("go").disabled=true;$("log").innerHTML="";$("res").hidden=true;
+  $("go").disabled=true;$("log").innerHTML="";$("res").hidden=true;$("prev").hidden=true;
   try{
     say("Читаю файлы…");
-    const items=await collect();
-    say(`Найдено книг: ${items.length}. Склеиваю…`);
-    const r=merge(items);
+    items=await collect();
+    const an=analyze(items,false);
+    order=an.list.map(p=>p.id);meta=Object.fromEntries(an.list.map(p=>[p.id,p.title]));
+    renderPrev();$("prev").hidden=false;
+    say(`Найдено книг: ${an.list.length}. Проверьте порядок и нажмите «Собрать файл».`);
+  }catch(e){say(e.message||String(e),"err")}
+  $("go").disabled=!files.length;
+};
+
+$("build").onclick=()=>{
+  $("res").hidden=true;
+  try{
+    const an=analyze(items,true);
+    const list=order.map(id=>an.list.find(p=>p.id===id)).filter(Boolean);
+    const auto=an.list.filter(p=>order.includes(p.id));
+    const r=build(an.srcs,list,an.notesKids,an.bins,$("cov").checked,list.some((p,i)=>p!==auto[i]));
     result={name:r.name,blob:new Blob([r.text],{type:"application/octet-stream"})};
     $("rname").textContent=r.name+".fb2";
     $("rinfo").textContent=`${r.count} книг, ${kb(result.blob.size)}`+(r.broken?`, битых ссылок: ${r.broken}`:"");
     $("res").hidden=false;$("hint").hidden=true;
     say("Готово ✓","ok");
   }catch(e){say(e.message||String(e),"err")}
-  $("go").disabled=!files.length;
 };
 
 $("save").onclick=async()=>{
