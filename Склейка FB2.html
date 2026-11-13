@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Склейка FB2</title>
+<style>
+:root{--bg:#faf9f6;--fg:#1f1e1c;--mut:#6b6860;--card:#fff;--bd:#e3e0d8;--ac:#c2562d;--acfg:#fff;--ok:#2d7a4b;--err:#b3261e;
+box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);color-scheme:light}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#1b1a18;--fg:#efece5;--mut:#a09b90;--card:#262522;--bd:#3a3834;--ac:#e0764a;--acfg:#1b1a18;--ok:#6cc08b;--err:#f2837c;color-scheme:dark}}
+:root[data-theme="dark"]{--bg:#1b1a18;--fg:#efece5;--mut:#a09b90;--card:#262522;--bd:#3a3834;--ac:#e0764a;--acfg:#1b1a18;--ok:#6cc08b;--err:#f2837c;color-scheme:dark}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.5 -apple-system,system-ui,"Segoe UI",Roboto,sans-serif}
+main{max-width:560px;margin:0 auto;padding:20px 16px 40px}
+h1{font-size:1.4rem;margin:.2em 0}
+p.sub{color:var(--mut);margin:0 0 18px;font-size:.95rem}
+.drop{display:block;border:2px dashed var(--bd);border-radius:14px;padding:26px 16px;text-align:center;background:var(--card);cursor:pointer}
+.drop.over{border-color:var(--ac)}
+.drop b{display:block;font-size:1.05rem;margin-bottom:4px}
+.drop span{color:var(--mut);font-size:.9rem}
+input[type=file]{display:none}
+ul{list-style:none;padding:0;margin:14px 0}
+li{display:flex;justify-content:space-between;gap:10px;padding:9px 12px;background:var(--card);border:1px solid var(--bd);border-radius:10px;margin-bottom:6px;font-size:.92rem}
+li span:first-child{overflow-wrap:anywhere}
+li span:last-child{color:var(--mut);white-space:nowrap}
+button{font:inherit;font-weight:600;border:0;border-radius:12px;padding:14px 18px;background:var(--ac);color:var(--acfg);width:100%;cursor:pointer}
+button.sec{background:transparent;color:var(--mut);border:1px solid var(--bd);margin-top:8px;font-weight:500}
+button:disabled{opacity:.5;cursor:default}
+#log{margin:14px 0;font-size:.9rem;color:var(--mut);white-space:pre-wrap;overflow-wrap:anywhere}
+.ok{color:var(--ok)}.err{color:var(--err)}
+.res{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:14px;margin-top:14px}
+.res h2{font-size:1rem;margin:0 0 4px;overflow-wrap:anywhere}
+.hint{font-size:.88rem;color:var(--mut);margin-top:10px}
+[hidden]{display:none!important}
+</style>
+</head>
+<body>
+<main>
+<h1>📚 Склейка FB2</h1>
+<p class="sub">Выберите скачанные zip и fb2 — получите одну книгу. Всё работает в браузере, файлы никуда не отправляются.</p>
+
+<label class="drop" id="drop"><b>Выбрать файлы</b><span>.zip и .fb2, можно сразу несколько</span>
+<input id="inp" type="file" multiple accept=".zip,.fb2,application/zip,application/x-fictionbook+xml,text/xml"></label>
+<ul id="list"></ul>
+<button id="go" disabled>Склеить</button>
+<button id="clr" class="sec" hidden>Очистить</button>
+<div id="log"></div>
+
+<div id="res" class="res" hidden>
+<h2 id="rname"></h2><div id="rinfo" class="sub"></div>
+<button id="save">Сохранить файл</button>
+<div id="hint" class="hint" hidden>Платформа не разрешает сохранять .fb2 напрямую, поэтому файл сохранён как <b>.fb2.txt</b>. Переименуйте его, убрав «.txt» в конце, — внутри обычный FB2.</div>
+</div>
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script>
+const FB="http://www.gribuser.ru/xml/fictionbook/2.0",XL="http://www.w3.org/1999/xlink";
+const $=id=>document.getElementById(id);
+let files=[],result=null;
+
+const kids=(e,n)=>e?[...e.children].filter(c=>c.localName===n):[];
+const kid=(e,n)=>kids(e,n)[0];
+const hrefAttr=e=>[...e.attributes].find(a=>a.localName==="href"&&a.namespaceURI===XL);
+const kb=n=>n>1048576?(n/1048576).toFixed(1)+" МБ":Math.max(1,Math.round(n/1024))+" КБ";
+const say=(t,c="")=>{const d=document.createElement("div");d.textContent=t;if(c)d.className=c;$("log").append(d)};
+
+function renderList(){
+  $("list").innerHTML="";
+  for(const f of files){const li=document.createElement("li");
+    const a=document.createElement("span");a.textContent=f.name;
+    const b=document.createElement("span");b.textContent=kb(f.size);
+    li.append(a,b);$("list").append(li)}
+  $("go").disabled=!files.length;$("clr").hidden=!files.length;
+}
+function addFiles(fl){
+  for(const f of fl){if(/\.(zip|fb2)$/i.test(f.name)&&!files.some(x=>x.name===f.name&&x.size===f.size))files.push(f)}
+  renderList();
+}
+$("inp").onchange=e=>{addFiles(e.target.files);e.target.value=""};
+$("clr").onclick=()=>{files=[];result=null;$("res").hidden=true;$("log").innerHTML="";renderList()};
+const dz=$("drop");
+dz.ondragover=e=>{e.preventDefault();dz.classList.add("over")};
+dz.ondragleave=()=>dz.classList.remove("over");
+dz.ondrop=e=>{e.preventDefault();dz.classList.remove("over");addFiles(e.dataTransfer.files)};
+
+function decode(buf){
+  const head=new TextDecoder("latin1").decode(buf.slice(0,300));
+  const m=/encoding\s*=\s*["']([^"']+)/i.exec(head);
+  let enc=(m?m[1]:"utf-8").toLowerCase();
+  let t;try{t=new TextDecoder(enc).decode(buf)}catch{t=new TextDecoder("utf-8").decode(buf)}
+  return t.replace(/^\uFEFF/,"");
+}
+
+async function collect(){
+  const out=[];
+  for(const f of files){
+    if(/\.fb2$/i.test(f.name)){out.push({name:f.name,buf:await f.arrayBuffer()});continue}
+    try{
+      const z=await JSZip.loadAsync(f);
+      const ents=Object.values(z.files).filter(e=>!e.dir&&/\.fb2$/i.test(e.name));
+      if(!ents.length)say(`• ${f.name}: в архиве нет fb2`,"err");
+      for(const e of ents)out.push({name:e.name.split("/").pop(),buf:await e.async("arraybuffer")});
+    }catch(err){say(`• ${f.name}: не удалось открыть архив`,"err")}
+  }
+  return out;
+}
+
+function prefixIds(doc,pre){
+  const all=[...doc.getElementsByTagName("*")];
+  const ids=new Set(all.map(e=>e.getAttribute("id")).filter(Boolean));
+  for(const e of all){
+    const id=e.getAttribute("id");if(id)e.setAttribute("id",pre+id);
+    const h=hrefAttr(e);
+    if(h&&h.value.startsWith("#")&&ids.has(h.value.slice(1)))h.value="#"+pre+h.value.slice(1);
+  }
+}
+
+function merge(items){
+  const books=[];
+  for(const it of items){
+    const doc=new DOMParser().parseFromString(decode(it.buf),"application/xml");
+    if(doc.getElementsByTagName("parsererror").length||doc.documentElement.localName!=="FictionBook"){say(`• ${it.name}: некорректный fb2, пропущен`,"err");continue}
+    const ti=kid(kid(doc.documentElement,"description"),"title-info");
+    const seq=kid(ti,"sequence");
+    const n=parseInt(seq?.getAttribute("number"));
+    books.push({doc,ti,name:it.name,num:isNaN(n)?Infinity:n,title:(kid(ti,"book-title")?.textContent||it.name).trim()});
+  }
+  if(books.length<2)throw new Error("Нужно минимум 2 корректные книги");
+  books.sort((a,b)=>a.num-b.num||a.name.localeCompare(b.name,undefined,{numeric:true}));
+  books.forEach((b,i)=>prefixIds(b.doc,`b${i+1}_`));
+
+  const base=books[0].doc,root=base.documentElement,ti=books[0].ti;
+  const seq0=kid(ti,"sequence"),seqName=seq0?.getAttribute("name");
+  const title=seqName||books[0].title;
+  kid(ti,"book-title").textContent=title;
+  seq0?.removeAttribute("number");
+  kids(ti,"annotation").forEach(a=>a.remove());
+  const ann=base.createElementNS(FB,"annotation");
+  [`Сборник из ${books.length} книг:`,...books.map((b,i)=>`${i+1}. ${b.title}`)].forEach(t=>{
+    const p=base.createElementNS(FB,"p");p.textContent=t;ann.append(p)});
+  const anchors=kids(ti,"genre").concat(kids(ti,"author"),kids(ti,"book-title"));
+  const last=anchors.sort((a,b)=>a.compareDocumentPosition(b)&4?-1:1).pop();
+  last.after(ann);
+
+  const main=base.createElementNS(FB,"body"),notes=base.createElementNS(FB,"body");
+  notes.setAttribute("name","notes");
+  const bins=[];
+  for(const b of books){
+    const sec=base.createElementNS(FB,"section"),t=base.createElementNS(FB,"title"),p=base.createElementNS(FB,"p");
+    p.textContent=b.title;t.append(p);sec.append(t);
+    for(const body of kids(b.doc.documentElement,"body")){
+      for(const ch of [...body.children]){
+        if(body.getAttribute("name")==="notes")notes.append(base.importNode(ch,true));
+        else if(ch.localName!=="title")sec.append(base.importNode(ch,true));
+      }
+    }
+    main.append(sec);
+    kids(b.doc.documentElement,"binary").forEach(x=>bins.push(base.importNode(x,true)));
+  }
+  [...root.children].filter(e=>/^(body|binary)$/.test(e.localName)).forEach(e=>e.remove());
+  root.append(main);if(notes.children.length)root.append(notes);
+  const used=new Set([...root.getElementsByTagName("*")].map(e=>hrefAttr(e)?.value).filter(v=>v&&v[0]==="#").map(v=>v.slice(1)));
+  bins.filter(x=>used.has(x.getAttribute("id"))).forEach(x=>root.append(x));
+
+  const au=kid(ti,"author");
+  const author=au?[kid(au,"last-name")?.textContent,kid(au,"first-name")?.textContent].filter(Boolean).join(" "):"";
+  const text='<?xml version="1.0" encoding="utf-8"?>\n'+new XMLSerializer().serializeToString(root);
+
+  // проверка результата
+  const chk=new DOMParser().parseFromString(text,"application/xml");
+  if(chk.getElementsByTagName("parsererror").length)throw new Error("Итоговый файл не прошёл проверку");
+  const ids=new Set([...chk.getElementsByTagName("*")].map(e=>e.getAttribute("id")).filter(Boolean));
+  const broken=[...chk.getElementsByTagName("*")].map(e=>hrefAttr(e)?.value).filter(v=>v&&v[0]==="#"&&!ids.has(v.slice(1))).length;
+  const name=(author?`${title} - ${author}`:title).replace(/[<>:"\/\\|?*]/g,"_").trim();
+  return{text,name,count:books.length,broken,titles:books.map(b=>b.title)};
+}
+
+$("go").onclick=async()=>{
+  $("go").disabled=true;$("log").innerHTML="";$("res").hidden=true;
+  try{
+    say("Читаю файлы…");
+    const items=await collect();
+    say(`Найдено книг: ${items.length}. Склеиваю…`);
+    const r=merge(items);
+    result={name:r.name,blob:new Blob([r.text],{type:"application/octet-stream"})};
+    $("rname").textContent=r.name+".fb2";
+    $("rinfo").textContent=`${r.count} книг, ${kb(result.blob.size)}`+(r.broken?`, битых ссылок: ${r.broken}`:"");
+    $("res").hidden=false;$("hint").hidden=true;
+    say("Готово ✓","ok");
+  }catch(e){say(e.message||String(e),"err")}
+  $("go").disabled=!files.length;
+};
+
+$("save").onclick=async()=>{
+  if(!result)return;
+  const dl=window.claude?.use?await claude.use("downloads"):null;
+  if(!dl){ // обычный браузер: прямое скачивание
+    const a=document.createElement("a");a.href=URL.createObjectURL(result.blob);a.download=result.name+".fb2";
+    document.body.append(a);a.click();a.remove();return;
+  }
+  try{await dl.save({filename:result.name+".fb2",data:result.blob})}
+  catch(e){
+    if(e&&e.code==="rejected_extension"){
+      try{await dl.save({filename:result.name+".fb2.txt",data:result.blob});$("hint").hidden=false}
+      catch(e2){if(e2.code!=="declined")say("Не удалось сохранить: "+(e2.code||e2.message),"err")}
+    }else if(e&&e.code!=="declined")say("Не удалось сохранить: "+(e.code||e.message),"err");
+  }
+};
+</script>
+</body>
+</html>
